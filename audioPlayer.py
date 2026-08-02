@@ -12,9 +12,24 @@ import socket
 from tendo import singleton
 from midi import MIDI_IN, getMidiinLabels, CONTROL_CHANGE
 
-# --- CONFIGURATION ---
-SERVER_URL = "http://127.0.0.1:8000/sync_check"
-DB_DIR = "/mnt/Data1/Documents/backNScoreData/database"
+# --- CHARGEMENT DE LA CONFIGURATION (config.json) ---
+CONFIG_FILE = "config.json"
+
+def load_config():
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"Erreur lecture {CONFIG_FILE}: {e}")
+    return {}
+
+config = load_config()
+
+SERVER_URL = config.get("server_url", "http://127.0.0.1:8000/sync_check")
+DB_DIR = config.get("db_dir", "/mnt/Data1/Documents/backNScoreData/database")
+BNS_DIR = config.get("bns_dir", "")
+
 MIDI_CONFIG_FILE = "midi_config.json"
 AUDIO_CONFIG_FILE = "audio_config.json"
 AUDIO_SPLASH_FILE = "audioSplash.mp3"
@@ -38,15 +53,18 @@ class AudioPlayerClient:
     def udp_listener(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.bind(("127.0.0.1", 9999))
+        print("Écouteur UDP démarré sur 127.0.0.1:9999")
         while True:
             try:
-                data, _ = sock.recvfrom(1024)
+                data, addr = sock.recvfrom(1024)
                 message = data.decode('utf-8').strip()
+                print(f"[UDP Reçu de {addr}] : {message}")
                 
-                # Si le message est un chemin de fichier ou un identifiant valide, on joue le média directement
+                # On cherche si le message correspond à un MP3 (absolu ou relatif via DB_DIR)
                 mp3_path = self.find_mp3(message)
+                
                 if mp3_path:
-                    print(f"Lecture demandée via UDP : {mp3_path}")
+                    print(f"Lecture du média trouvé : {mp3_path}")
                     self.player.set_media(self.instance.media_new(mp3_path))
                     self.player.play()
                 else:
@@ -194,18 +212,52 @@ class AudioPlayerClient:
 
     def find_mp3(self, loc):
         if os.path.isfile(loc):
-            if loc.endswith("mp3"):
+            if loc.lower().endswith("mp3"):
                 return loc
             else:
                 return None
         loc = loc.lstrip('/')
         track_path = os.path.join(DB_DIR, loc)
-        for filename in ["backtrack.mp3", "melody.mp3"]:
-            full_path = os.path.join(track_path, filename)
-            if os.path.exists(full_path):
-                return full_path
-        # pas de mp3 trouvé
         
+        # Si c'est un dossier, on cherche selon l'ordre de priorité du mp3_types.json de BNS
+        if os.path.isdir(track_path):
+            mp3_types = []
+            if BNS_DIR:
+                types_file = os.path.join(BNS_DIR, "server_data", "mp3_types.json")
+                if os.path.exists(types_file):
+                    try:
+                        with open(types_file, 'r', encoding='utf-8') as f:
+                            mp3_types = json.load(f)
+                    except Exception:
+                        pass
+
+            # Repli par défaut si BNS_DIR n'est pas renseigné ou fichier introuvable
+            if not mp3_types:
+                mp3_types = [
+                    "noPiano",
+                    "demo",
+                    "noSecond",
+                    "melody",
+                    "backtrack",
+                    "noWind",
+                    "noDrum",
+                    "noBass"
+                ]
+
+            for t in mp3_types:
+                filename = t if t.lower().endswith(".mp3") else f"{t}.mp3"
+                full_path = os.path.join(track_path, filename)
+                if os.path.exists(full_path):
+                    return full_path
+
+            # S'il y a d'autres .mp3 dans le dossier non listés
+            try:
+                for f in os.listdir(track_path):
+                    if f.lower().endswith(".mp3"):
+                        return os.path.join(track_path, f)
+            except Exception:
+                pass
+                
         return None
 
     def main_loop(self):
