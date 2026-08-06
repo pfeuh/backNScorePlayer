@@ -42,6 +42,7 @@ class AudioPlayerClient:
         self.player = self.instance.media_player_new()
         self.current_loc = None
         self.current_db_track_path = None
+        self.current_mp3_path = None  # Chemin complet du MP3 en cours (pour la persistance par piste)
         self.midi_config = {}
         self.midi_in = MIDI_IN()
         self.midi_out = MIDI_OUT()
@@ -52,7 +53,8 @@ class AudioPlayerClient:
         # État interne & anti-rebond MIDI
         self.locators = {"a": 0, "b": 0, "c": 0, "d": 0}
         self.is_muted = False
-        self.is_looping = False # État de la boucle active
+        self.is_looping = False
+        self.current_rate = 1.0
         
         # Variables pour la gestion fluide et sans perte du volume système
         self.target_system_volume = None
@@ -74,14 +76,16 @@ class AudioPlayerClient:
                     if os.path.isfile(message):
                         print(f"-> Chargement via Pop-up Système (Fichier direct) : {mp3_path}")
                         self.current_db_track_path = None
+                        self.current_mp3_path = mp3_path
                     else:
                         print(f"-> Chargement via UDP (Répertoire Database) : {mp3_path}")
 
                     self.locators = {"a": 0, "b": 0, "c": 0, "d": 0}
                     self.clear_all_tags_leds()
-                    self.disable_loop() # Désactive la boucle au changement de morceau
+                    self.disable_loop()
+                    self.reset_speed()
                     
-                    if self.current_db_track_path:
+                    if self.current_db_track_path and self.current_mp3_path:
                         self.load_tags_for_current_track()
                     
                     self.player.set_media(self.instance.media_new(mp3_path))
@@ -115,7 +119,10 @@ class AudioPlayerClient:
             "set_b": 65,
             "set_c": 66,
             "set_d": 67,
-            "cycle": 46
+            "cycle": 46,
+            "speed_up": 58,
+            "speed_down": 59,
+            "speed_reset": 60
         }
         self.save_midi_config()
         return True
@@ -147,23 +154,30 @@ class AudioPlayerClient:
             self.set_led("cycle", False)
 
     def disable_loop(self):
-        """Désactive proprement la boucle et éteint la LED Cycle"""
         self.is_looping = False
         self.set_led("cycle", False)
 
-    # --- GESTION DE LA PERSISTANCE DES TAGS ---
+    def reset_speed(self):
+        self.current_rate = 1.0
+        self.player.set_rate(self.current_rate)
+
+    # --- GESTION DE LA PERSISTANCE DES TAGS PAR FICHIER MP3 ---
     def save_tags_for_current_track(self):
-        if self.current_db_track_path and os.path.isdir(self.current_db_track_path):
-            tags_file = os.path.join(self.current_db_track_path, "tags.json")
+        if self.current_mp3_path:
+            # Ex: /path/to/track/melody.mp3 -> /path/to/track/melody.json
+            base_name, _ = os.path.splitext(self.current_mp3_path)
+            tags_file = f"{base_name}.json"
             try:
                 with open(tags_file, 'w', encoding='utf-8') as f:
                     json.dump(self.locators, f, indent=4)
+                print(f"Tags sauvegardés dans : {tags_file}")
             except Exception as e:
                 print(f"Erreur sauvegarde tags: {e}")
 
     def load_tags_for_current_track(self):
-        if self.current_db_track_path and os.path.isdir(self.current_db_track_path):
-            tags_file = os.path.join(self.current_db_track_path, "tags.json")
+        if self.current_mp3_path:
+            base_name, _ = os.path.splitext(self.current_mp3_path)
+            tags_file = f"{base_name}.json"
             if os.path.exists(tags_file):
                 try:
                     with open(tags_file, 'r', encoding='utf-8') as f:
@@ -173,6 +187,7 @@ class AudioPlayerClient:
                                 self.locators[key] = loaded_tags[key]
                                 if self.locators[key] > 0:
                                     self.set_led(f"goto_{key}", True)
+                    print(f"Tags chargés depuis : {tags_file}")
                 except Exception as e:
                     print(f"Erreur lecture tags: {e}")
 
@@ -239,10 +254,12 @@ class AudioPlayerClient:
                 self.player.play()
             else:
                 self.player.play()
+                self.player.set_rate(self.current_rate)
         
         elif action == "stop":
             self.player.stop()
             self.disable_loop()
+            self.reset_speed()
             
         elif action == "mute":
             self.is_muted = not self.is_muted
@@ -257,9 +274,21 @@ class AudioPlayerClient:
         elif action == "rewind":
             self.player.set_time(max(0, self.player.get_time() - FF_RW_MSEC))
 
-        # --- GESTION DU BOUTON CYCLE (Boucle A-B) ---
+        elif action == "speed_up":
+            self.current_rate = round(min(2.0, self.current_rate + 0.05), 2)
+            self.player.set_rate(self.current_rate)
+            print(f"Vitesse de lecture : {int(self.current_rate * 100)}%")
+
+        elif action == "speed_down":
+            self.current_rate = round(max(0.3, self.current_rate - 0.05), 2)
+            self.player.set_rate(self.current_rate)
+            print(f"Vitesse de lecture : {int(self.current_rate * 100)}%")
+
+        elif action == "speed_reset":
+            self.reset_speed()
+            print("Vitesse de lecture réinitialisée à 100%")
+
         elif action == "cycle":
-            # On vérifie que les tags A et B sont bien définis et que B est après A
             if self.locators["a"] < self.locators["b"]:
                 self.is_looping = not self.is_looping
                 self.set_led("cycle", self.is_looping)
@@ -268,7 +297,6 @@ class AudioPlayerClient:
                 print("Impossible d'activer la boucle : Tag A et Tag B invalides (A doit être < B).")
                 self.disable_loop()
 
-        # --- GESTION DES TAGS / LOCATORS ---
         elif action.startswith("set_"):
             key = action.split("_")[1]
             self.locators[key] = self.player.get_time()
@@ -323,9 +351,11 @@ class AudioPlayerClient:
 
     def find_mp3(self, loc):
         self.current_db_track_path = None
+        self.current_mp3_path = None
 
         if os.path.isfile(loc):
             if loc.lower().endswith("mp3"):
+                self.current_mp3_path = loc
                 return loc
             else:
                 return None
@@ -353,12 +383,15 @@ class AudioPlayerClient:
                 filename = t if t.lower().endswith(".mp3") else f"{t}.mp3"
                 full_path = os.path.join(track_path, filename)
                 if os.path.exists(full_path):
+                    self.current_mp3_path = full_path
                     return full_path
 
             try:
                 for f in os.listdir(track_path):
                     if f.lower().endswith(".mp3"):
-                        return os.path.join(track_path, f)
+                        full_path = os.path.join(track_path, f)
+                        self.current_mp3_path = full_path
+                        return full_path
             except Exception:
                 pass
                 
@@ -368,12 +401,10 @@ class AudioPlayerClient:
         print("Audio Player démarré")
         while True:
             try:
-                # --- SURVEILLANCE DE LA BOUCLE A-B ---
                 if self.is_looping and self.player.get_state() == vlc.State.Playing:
                     current_time = self.player.get_time()
                     tag_b = self.locators["b"]
                     tag_a = self.locators["a"]
-                    # Si on dépasse le tag B, on saute directement au tag A
                     if current_time >= tag_b:
                         self.player.set_time(tag_a)
 
@@ -387,10 +418,11 @@ class AudioPlayerClient:
                         self.locators = {"a": 0, "b": 0, "c": 0, "d": 0}
                         self.clear_all_tags_leds()
                         self.disable_loop()
+                        self.reset_speed()
                         
                         mp3_path = self.find_mp3(new_loc)
                         
-                        if self.current_db_track_path:
+                        if self.current_db_track_path and self.current_mp3_path:
                             self.load_tags_for_current_track()
 
                         if mp3_path != None:
@@ -400,7 +432,7 @@ class AudioPlayerClient:
                         self.player.play()
             except Exception as e:
                 pass
-            time.sleep(0.05) # Fréquence de vérification resserrée pour la précision de la boucle
+            time.sleep(0.05)
 
 if __name__ == "__main__":
     try:
