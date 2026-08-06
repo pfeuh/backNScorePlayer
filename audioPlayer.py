@@ -41,6 +41,7 @@ class AudioPlayerClient:
         self.instance = vlc.Instance('--no-video', '--quiet')
         self.player = self.instance.media_player_new()
         self.current_loc = None
+        self.current_db_track_path = None
         self.midi_config = {}
         self.midi_in = MIDI_IN()
         self.midi_out = MIDI_OUT()
@@ -51,6 +52,7 @@ class AudioPlayerClient:
         # État interne & anti-rebond MIDI
         self.locators = {"a": 0, "b": 0, "c": 0, "d": 0}
         self.is_muted = False
+        self.is_looping = False # État de la boucle active
         
         # Variables pour la gestion fluide et sans perte du volume système
         self.target_system_volume = None
@@ -69,7 +71,19 @@ class AudioPlayerClient:
                 
                 mp3_path = self.find_mp3(message)
                 if mp3_path:
-                    print(f"Lecture du média trouvé : {mp3_path}")
+                    if os.path.isfile(message):
+                        print(f"-> Chargement via Pop-up Système (Fichier direct) : {mp3_path}")
+                        self.current_db_track_path = None
+                    else:
+                        print(f"-> Chargement via UDP (Répertoire Database) : {mp3_path}")
+
+                    self.locators = {"a": 0, "b": 0, "c": 0, "d": 0}
+                    self.clear_all_tags_leds()
+                    self.disable_loop() # Désactive la boucle au changement de morceau
+                    
+                    if self.current_db_track_path:
+                        self.load_tags_for_current_track()
+                    
                     self.player.set_media(self.instance.media_new(mp3_path))
                     self.player.play()
                 else:
@@ -86,7 +100,6 @@ class AudioPlayerClient:
             except Exception as e:
                 print(f"Erreur lecture {MIDI_CONFIG_FILE}: {e}")
         
-        # Si le fichier n'existe pas ou est corrompu, on crée une configuration par défaut
         print(f"Fichier {MIDI_CONFIG_FILE} introuvable. Création d'une configuration par défaut...")
         self.midi_config = {
             "system_volume": 7,
@@ -101,7 +114,8 @@ class AudioPlayerClient:
             "set_a": 64,
             "set_b": 65,
             "set_c": 66,
-            "set_d": 67
+            "set_d": 67,
+            "cycle": 46
         }
         self.save_midi_config()
         return True
@@ -111,7 +125,6 @@ class AudioPlayerClient:
             json.dump(self.midi_config, f, indent=4)
 
     def set_led(self, control_or_action, state):
-        """Allume (127) ou éteint (0) la LED associée via Control Change (mode externe)"""
         cc = None
         if isinstance(control_or_action, int):
             cc = control_or_action
@@ -126,15 +139,45 @@ class AudioPlayerClient:
                 print(f"Erreur envoi LED CC {cc}: {e}")
 
     def clear_all_tags_leds(self):
-        """Éteint les LED de tous les boutons R (goto)"""
         for key in ["a", "b", "c", "d"]:
             action = f"goto_{key}"
             if action in self.midi_config:
                 self.set_led(action, False)
+        if "cycle" in self.midi_config:
+            self.set_led("cycle", False)
 
-    # --- FONCTIONS DE CONTRÔLE VOLUME PC (wpctl avec Worker fluide sans perte) ---
+    def disable_loop(self):
+        """Désactive proprement la boucle et éteint la LED Cycle"""
+        self.is_looping = False
+        self.set_led("cycle", False)
+
+    # --- GESTION DE LA PERSISTANCE DES TAGS ---
+    def save_tags_for_current_track(self):
+        if self.current_db_track_path and os.path.isdir(self.current_db_track_path):
+            tags_file = os.path.join(self.current_db_track_path, "tags.json")
+            try:
+                with open(tags_file, 'w', encoding='utf-8') as f:
+                    json.dump(self.locators, f, indent=4)
+            except Exception as e:
+                print(f"Erreur sauvegarde tags: {e}")
+
+    def load_tags_for_current_track(self):
+        if self.current_db_track_path and os.path.isdir(self.current_db_track_path):
+            tags_file = os.path.join(self.current_db_track_path, "tags.json")
+            if os.path.exists(tags_file):
+                try:
+                    with open(tags_file, 'r', encoding='utf-8') as f:
+                        loaded_tags = json.load(f)
+                        for key in ["a", "b", "c", "d"]:
+                            if key in loaded_tags:
+                                self.locators[key] = loaded_tags[key]
+                                if self.locators[key] > 0:
+                                    self.set_led(f"goto_{key}", True)
+                except Exception as e:
+                    print(f"Erreur lecture tags: {e}")
+
+    # --- FONCTIONS DE CONTRÔLE VOLUME PC ---
     def set_system_volume(self, value):
-        """Met à jour la cible du volume et s'assure qu'un thread dédié applique la dernière valeur sans sauter le 127"""
         with self._lock:
             self.target_system_volume = value
 
@@ -148,10 +191,8 @@ class AudioPlayerClient:
             with self._lock:
                 current_target = self.target_system_volume
 
-            # Si on a atteint la dernière valeur demandée et qu'il n'y a plus de mouvement, on met en pause le thread
             if current_target == last_applied:
                 with self._lock:
-                    # Double check si rien n'a bougé entre temps
                     if self.target_system_volume == last_applied:
                         self.volume_thread_running = False
                         break
@@ -161,11 +202,9 @@ class AudioPlayerClient:
                 vol = current_target / 127.0
                 subprocess.run(["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", f"{vol}"], check=False)
 
-            # Petit délai pour cadencer proprement les appels système sans engorger wpctl
             time.sleep(0.03)
 
     def toggle_system_mute(self):
-        """Bascule l'état Mute de la carte son principale du PC"""
         subprocess.run(["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"], check=False)
 
     def midi_callback(self, channel, control, value, timestamp):
@@ -203,6 +242,7 @@ class AudioPlayerClient:
         
         elif action == "stop":
             self.player.stop()
+            self.disable_loop()
             
         elif action == "mute":
             self.is_muted = not self.is_muted
@@ -217,12 +257,24 @@ class AudioPlayerClient:
         elif action == "rewind":
             self.player.set_time(max(0, self.player.get_time() - FF_RW_MSEC))
 
+        # --- GESTION DU BOUTON CYCLE (Boucle A-B) ---
+        elif action == "cycle":
+            # On vérifie que les tags A et B sont bien définis et que B est après A
+            if self.locators["a"] < self.locators["b"]:
+                self.is_looping = not self.is_looping
+                self.set_led("cycle", self.is_looping)
+                print(f"Boucle A-B : {'ACTIVÉE' if self.is_looping else 'DÉSACTIVÉE'}")
+            else:
+                print("Impossible d'activer la boucle : Tag A et Tag B invalides (A doit être < B).")
+                self.disable_loop()
+
         # --- GESTION DES TAGS / LOCATORS ---
         elif action.startswith("set_"):
             key = action.split("_")[1]
             self.locators[key] = self.player.get_time()
             print(f"Tag {key.upper()} mémorisé à {self.locators[key]/1000:.1f}s")
             self.set_led(f"goto_{key}", True)
+            self.save_tags_for_current_track()
 
         elif action.startswith("goto_"):
             key = action.split("_")[1]
@@ -234,7 +286,6 @@ class AudioPlayerClient:
             print("Erreur: Aucun fichier config MIDI.")
             sys.exit(1)
         
-        # Connexion Entrée MIDI
         labels_in = getMidiinLabels()
         found_in = False
         for i, l in enumerate(labels_in):
@@ -248,7 +299,6 @@ class AudioPlayerClient:
         if not found_in:
             print("Contrôleur MIDI Entrée non trouvé.")
 
-        # Connexion Sortie MIDI (pour piloter les LED)
         labels_out = getMidioutLabels()
         found_out = False
         for i, l in enumerate(labels_out):
@@ -272,15 +322,20 @@ class AudioPlayerClient:
                 print(f"Impossible d'envoyer le SysEx LED: {e}")
 
     def find_mp3(self, loc):
+        self.current_db_track_path = None
+
         if os.path.isfile(loc):
             if loc.lower().endswith("mp3"):
                 return loc
             else:
                 return None
+        
         loc = loc.lstrip('/')
         track_path = os.path.join(DB_DIR, loc)
         
         if os.path.isdir(track_path):
+            self.current_db_track_path = track_path
+
             mp3_types = []
             if BNS_DIR:
                 types_file = os.path.join(BNS_DIR, "server_data", "mp3_types.json")
@@ -313,16 +368,31 @@ class AudioPlayerClient:
         print("Audio Player démarré")
         while True:
             try:
+                # --- SURVEILLANCE DE LA BOUCLE A-B ---
+                if self.is_looping and self.player.get_state() == vlc.State.Playing:
+                    current_time = self.player.get_time()
+                    tag_b = self.locators["b"]
+                    tag_a = self.locators["a"]
+                    # Si on dépasse le tag B, on saute directement au tag A
+                    if current_time >= tag_b:
+                        self.player.set_time(tag_a)
+
                 response = requests.get(SERVER_URL, timeout=5)
                 if response.status_code == 200:
                     new_loc = response.text.strip()
                     if new_loc != self.current_loc:
-                        print(new_loc)
+                        print(f"-> Chargement via Database (Polling HTTP) : {new_loc}")
                         self.current_loc = new_loc 
                         
+                        self.locators = {"a": 0, "b": 0, "c": 0, "d": 0}
                         self.clear_all_tags_leds()
+                        self.disable_loop()
                         
                         mp3_path = self.find_mp3(new_loc)
+                        
+                        if self.current_db_track_path:
+                            self.load_tags_for_current_track()
+
                         if mp3_path != None:
                             self.player.set_media(self.instance.media_new(mp3_path))
                         else:
@@ -330,7 +400,7 @@ class AudioPlayerClient:
                         self.player.play()
             except Exception as e:
                 pass
-            time.sleep(2)
+            time.sleep(0.05) # Fréquence de vérification resserrée pour la précision de la boucle
 
 if __name__ == "__main__":
     try:
