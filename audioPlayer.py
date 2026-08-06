@@ -9,8 +9,9 @@ import sys
 import json
 import threading
 import socket
+import subprocess
 from tendo import singleton
-from midi import MIDI_IN, getMidiinLabels, CONTROL_CHANGE
+from midi import MIDI_IN, MIDI_OUT, getMidiinLabels, getMidioutLabels, CONTROL_CHANGE, NOTE_ON
 
 # --- CHARGEMENT DE LA CONFIGURATION (config.json) ---
 CONFIG_FILE = "config.json"
@@ -42,13 +43,19 @@ class AudioPlayerClient:
         self.current_loc = None
         self.midi_config = {}
         self.midi_in = MIDI_IN()
+        self.midi_out = MIDI_OUT()
         self.learning_mode = False
         self.pending_action = None
         self.last_cc_seen = None
         
-        # État interne
+        # État interne & anti-rebond MIDI
         self.locators = {"a": 0, "b": 0, "c": 0, "d": 0}
         self.is_muted = False
+        
+        # Variables pour la gestion fluide et sans perte du volume système
+        self.target_system_volume = None
+        self.volume_thread_running = False
+        self._lock = threading.Lock()
 
     def udp_listener(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -60,70 +67,137 @@ class AudioPlayerClient:
                 message = data.decode('utf-8').strip()
                 print(f"[UDP Reçu de {addr}] : {message}")
                 
-                # On cherche si le message correspond à un MP3 (absolu ou relatif via DB_DIR)
                 mp3_path = self.find_mp3(message)
-                
                 if mp3_path:
                     print(f"Lecture du média trouvé : {mp3_path}")
                     self.player.set_media(self.instance.media_new(mp3_path))
                     self.player.play()
                 else:
-                    # Sinon, on traite comme une action standard (play, stop, etc.)
                     self.execute_action(message, 127)
             except Exception as e:
                 print(f"Erreur UDP: {e}")
 
     def load_midi_config(self):
         if os.path.exists(MIDI_CONFIG_FILE):
-            with open(MIDI_CONFIG_FILE, 'r') as f:
-                self.midi_config = json.load(f)
-            return True
-        return False
+            try:
+                with open(MIDI_CONFIG_FILE, 'r', encoding='utf-8') as f:
+                    self.midi_config = json.load(f)
+                return True
+            except Exception as e:
+                print(f"Erreur lecture {MIDI_CONFIG_FILE}: {e}")
+        
+        # Si le fichier n'existe pas ou est corrompu, on crée une configuration par défaut
+        print(f"Fichier {MIDI_CONFIG_FILE} introuvable. Création d'une configuration par défaut...")
+        self.midi_config = {
+            "system_volume": 7,
+            "play": 41,
+            "stop": 42,
+            "mute": 43,
+            "volume": 14,
+            "goto_a": 48,
+            "goto_b": 49,
+            "goto_c": 50,
+            "goto_d": 51,
+            "set_a": 64,
+            "set_b": 65,
+            "set_c": 66,
+            "set_d": 67
+        }
+        self.save_midi_config()
+        return True
 
     def save_midi_config(self):
         with open(MIDI_CONFIG_FILE, 'w') as f:
             json.dump(self.midi_config, f, indent=4)
 
+    def set_led(self, control_or_action, state):
+        """Allume (127) ou éteint (0) la LED associée via Control Change (mode externe)"""
+        cc = None
+        if isinstance(control_or_action, int):
+            cc = control_or_action
+        elif control_or_action in self.midi_config:
+            cc = int(self.midi_config[control_or_action])
+        
+        if cc is not None:
+            val = 127 if state else 0
+            try:
+                self.midi_out.control_change(cc, val, channel=0)
+            except Exception as e:
+                print(f"Erreur envoi LED CC {cc}: {e}")
+
+    def clear_all_tags_leds(self):
+        """Éteint les LED de tous les boutons R (goto)"""
+        for key in ["a", "b", "c", "d"]:
+            action = f"goto_{key}"
+            if action in self.midi_config:
+                self.set_led(action, False)
+
+    # --- FONCTIONS DE CONTRÔLE VOLUME PC (wpctl avec Worker fluide sans perte) ---
+    def set_system_volume(self, value):
+        """Met à jour la cible du volume et s'assure qu'un thread dédié applique la dernière valeur sans sauter le 127"""
+        with self._lock:
+            self.target_system_volume = value
+
+        if not self.volume_thread_running:
+            self.volume_thread_running = True
+            threading.Thread(target=self._process_system_volume_queue, daemon=True).start()
+
+    def _process_system_volume_queue(self):
+        last_applied = -1
+        while True:
+            with self._lock:
+                current_target = self.target_system_volume
+
+            # Si on a atteint la dernière valeur demandée et qu'il n'y a plus de mouvement, on met en pause le thread
+            if current_target == last_applied:
+                with self._lock:
+                    # Double check si rien n'a bougé entre temps
+                    if self.target_system_volume == last_applied:
+                        self.volume_thread_running = False
+                        break
+
+            if current_target is not None:
+                last_applied = current_target
+                vol = current_target / 127.0
+                subprocess.run(["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", f"{vol}"], check=False)
+
+            # Petit délai pour cadencer proprement les appels système sans engorger wpctl
+            time.sleep(0.03)
+
+    def toggle_system_mute(self):
+        """Bascule l'état Mute de la carte son principale du PC"""
+        subprocess.run(["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"], check=False)
+
     def midi_callback(self, channel, control, value, timestamp):
-        if self.learning_mode and self.pending_action:
-
-            # On ignore les répétitions du même CC
-            if control == self.last_cc_seen:
-                return
-
-            self.last_cc_seen = control
-
-            self.midi_config[self.pending_action] = control
-
-            self.pending_action = None
-
-        else:
-            for action, mapped_control in self.midi_config.items():
-                if control == int(mapped_control):
-                    self.execute_action(action, value)
+        for action, mapped_control in self.midi_config.items():
+            if control == int(mapped_control):
+                if value == 0 and action not in ["volume", "system_volume"]:
+                    return
+                self.execute_action(action, value)
+                break
 
     def execute_action(self, action, value):
-        # --- ACTIONS CONTINUES (Sliders / Potards) ---
         if action == "volume":
             vlc_vol = int((value / 127.0) * 100)
-
             self.player.audio_set_mute(False)
             self.player.audio_set_volume(vlc_vol)
             return
 
-        # --- ACTIONS BINAIRES (Boutons - On ignore le relâchement value=0) ---
-        if value == 0: return
+        elif action == "system_volume":
+            self.set_system_volume(value)
+            return
 
-        elif action == "play":
+        elif action == "system_mute":
+            self.toggle_system_mute()
+            return
+
+        if action == "play":
             state = self.player.get_state()
-
             if state == vlc.State.Playing:
                 self.player.pause()
-
             elif state == vlc.State.Ended:
                 self.player.stop()
                 self.player.play()
-
             else:
                 self.player.play()
         
@@ -143,72 +217,59 @@ class AudioPlayerClient:
         elif action == "rewind":
             self.player.set_time(max(0, self.player.get_time() - FF_RW_MSEC))
 
-        # --- GESTION DES LOCATORS ---
+        # --- GESTION DES TAGS / LOCATORS ---
         elif action.startswith("set_"):
             key = action.split("_")[1]
             self.locators[key] = self.player.get_time()
-            print(f"Locator {key.upper()} mémorisé à {self.locators[key]/1000:.1f}s")
+            print(f"Tag {key.upper()} mémorisé à {self.locators[key]/1000:.1f}s")
+            self.set_led(f"goto_{key}", True)
 
         elif action.startswith("goto_"):
             key = action.split("_")[1]
             self.player.set_time(self.locators.get(key, 0))
-            print(f"Saut vers Locator {key.upper()}")
-
-    def run_config_wizard(self):
-        print("\n--- MODE CONFIGURATION MIDI (LEARN) ---")
-        labels = getMidiinLabels()
-        for i, l in enumerate(labels): print(f"[{i}] {l}")
-        
-        try:
-            idx = int(input("\nChoisissez l'index du port MIDI : "))
-            self.midi_in.open(idx)
-        except (ValueError, IndexError):
-            print("Index invalide.")
-            sys.exit(1)
-
-        self.midi_in.callbacks[CONTROL_CHANGE] = self.midi_callback
-        self.learning_mode = True
-
-        actions = [
-            "volume", "mute", "play", "stop", "goto_start", 
-            "rewind", "ff", "set_a", "goto_a", "set_b", "goto_b", 
-            "set_c", "goto_c", "set_d", "goto_d"
-        ]
-
-        for action in actions:
-            self.pending_action = action
-            # On définit le message selon le type d'action
-            if action in ["volume", "balance"]:
-                instruction = "BOUGEZ le curseur ou potard"
-            else:
-                instruction = "APPUYEZ sur le bouton"
-            
-            print(f"\n[{instruction}] pour l'action : {action.upper()}")
-            
-            # Attente de l'entrée MIDI via le callback
-            while self.pending_action is not None:
-                time.sleep(0.1)
-        
-        self.save_midi_config()
-        print("\nConfiguration terminée avec succès. Relancez sans l'option -config.")
-        sys.exit(0)
+            print(f"Saut vers Tag {key.upper()}")
 
     def setup_midi_runtime(self):
         if not self.load_midi_config():
-            print("Erreur: Aucun fichier config. Lancez avec -config")
+            print("Erreur: Aucun fichier config MIDI.")
             sys.exit(1)
         
-        labels = getMidiinLabels()
-        found = False
-        for i, l in enumerate(labels):
-            if any(name in l.lower() for name in ["nano", "genos"]):
+        # Connexion Entrée MIDI
+        labels_in = getMidiinLabels()
+        found_in = False
+        for i, l in enumerate(labels_in):
+            if any(name in l.lower() for name in ["nanokontrol", "genos", "nano"]):
                 self.midi_in.open(i)
                 self.midi_in.callbacks[CONTROL_CHANGE] = self.midi_callback
-                print(f"MIDI connecté à : {l}")
-                found = True
+                self.midi_in.callbacks[NOTE_ON] = self.midi_callback
+                print(f"MIDI Entrée connecté à : {l}")
+                found_in = True
                 break
-        if not found:
-            print("Contrôleur MIDI non trouvé.")
+        if not found_in:
+            print("Contrôleur MIDI Entrée non trouvé.")
+
+        # Connexion Sortie MIDI (pour piloter les LED)
+        labels_out = getMidioutLabels()
+        found_out = False
+        for i, l in enumerate(labels_out):
+            if any(name in l.lower() for name in ["nanokontrol", "genos", "nano"]):
+                self.midi_out.open(i)
+                print(f"MIDI Sortie connecté à : {l}")
+                found_out = True
+                break
+        if not found_out:
+            print("Contrôleur MIDI Sortie non trouvé (les LED ne s'allumeront pas).")
+        else:
+            try:
+                korg_global_sysex = [
+                    0x42, 0x40, 0x00, 0x01, 0x03, 0x00, 0x42, 
+                    0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+                    0x00, 0x00, 0x00, 0x00, 0x01
+                ]
+                self.midi_out.sysex(korg_global_sysex)
+                print("Trame SysEx de configuration LED External envoyée au nanoKONTROL.")
+            except Exception as e:
+                print(f"Impossible d'envoyer le SysEx LED: {e}")
 
     def find_mp3(self, loc):
         if os.path.isfile(loc):
@@ -219,7 +280,6 @@ class AudioPlayerClient:
         loc = loc.lstrip('/')
         track_path = os.path.join(DB_DIR, loc)
         
-        # Si c'est un dossier, on cherche selon l'ordre de priorité du mp3_types.json de BNS
         if os.path.isdir(track_path):
             mp3_types = []
             if BNS_DIR:
@@ -231,18 +291,8 @@ class AudioPlayerClient:
                     except Exception:
                         pass
 
-            # Repli par défaut si BNS_DIR n'est pas renseigné ou fichier introuvable
             if not mp3_types:
-                mp3_types = [
-                    "noPiano",
-                    "demo",
-                    "noSecond",
-                    "melody",
-                    "backtrack",
-                    "noWind",
-                    "noDrum",
-                    "noBass"
-                ]
+                mp3_types = ["noPiano", "demo", "noSecond", "melody", "backtrack", "noWind", "noDrum", "noBass"]
 
             for t in mp3_types:
                 filename = t if t.lower().endswith(".mp3") else f"{t}.mp3"
@@ -250,7 +300,6 @@ class AudioPlayerClient:
                 if os.path.exists(full_path):
                     return full_path
 
-            # S'il y a d'autres .mp3 dans le dossier non listés
             try:
                 for f in os.listdir(track_path):
                     if f.lower().endswith(".mp3"):
@@ -270,6 +319,9 @@ class AudioPlayerClient:
                     if new_loc != self.current_loc:
                         print(new_loc)
                         self.current_loc = new_loc 
+                        
+                        self.clear_all_tags_leds()
+                        
                         mp3_path = self.find_mp3(new_loc)
                         if mp3_path != None:
                             self.player.set_media(self.instance.media_new(mp3_path))
@@ -277,35 +329,29 @@ class AudioPlayerClient:
                             self.player.set_media(self.instance.media_new("./404_vocal_msg.mp3"))
                         self.player.play()
             except Exception as e:
-                # On évite de polluer la console si le serveur est juste éteint temporairement
                 pass
             time.sleep(2)
 
 if __name__ == "__main__":
-    
     try:
         me = singleton.SingleInstance()
     except singleton.SingleInstanceException:
         print(f"Erreur : Une autre instance {sys.argv[0]} est déjà en cours d'exécution.")
         sys.exit(1)
 
-    # on créé la classe audioPlayer
     audio_client = AudioPlayerClient()
 
     if "-config" in sys.argv:
         audio_client.run_config_wizard()
     else:
         audio_client.setup_midi_runtime()
-        # Thread 1 : Surveillance du changement de morceau (Polling 2s)
         thread = threading.Thread(target=audio_client.main_loop, daemon=True)
         thread.start()
         
-        # Thread 2 : Commandes Web Instantanées (UDP)
         thread_udp = threading.Thread(target=audio_client.udp_listener, daemon=True)
         thread_udp.start()
         
         try:
-            # Boucle principale pour garder le script actif et réactif au MIDI
             while True: 
                 time.sleep(1)
         except KeyboardInterrupt:
