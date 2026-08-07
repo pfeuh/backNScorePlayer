@@ -55,10 +55,16 @@ class AudioPlayerClient:
         self.is_muted = False
         self.is_looping = False
         self.current_rate = 1.0
+        self.speed_mode_active = False  # État du mode édition de vitesse (bouton S)
+        self.last_pot_value = 127       # Mémorisation de la dernière position physique du potard (défaut = max/100%)
         
-        # Variables pour la gestion fluide et sans perte du volume système
+        # Variables pour la gestion fluide et sans perte du volume système et de la vitesse
         self.target_system_volume = None
         self.volume_thread_running = False
+        
+        # Système intelligent de gestion de la vitesse (tendance / anti-latence)
+        self.target_speed_value = None
+        self.speed_thread_running = False
         self._lock = threading.Lock()
 
     def udp_listener(self):
@@ -86,10 +92,13 @@ class AudioPlayerClient:
                     self.reset_speed()
                     
                     if self.current_db_track_path and self.current_mp3_path:
-                        self.load_tags_for_current_track()
+                        self.load_track_data()
                     
-                    self.player.set_media(self.instance.media_new(mp3_path))
+                    self.player.stop()
+                    media = self.instance.media_new(mp3_path)
+                    self.player.set_media(media)
                     self.player.play()
+                    self.player.set_rate(self.current_rate)
                 else:
                     self.execute_action(message, 127)
             except Exception as e:
@@ -107,22 +116,22 @@ class AudioPlayerClient:
         print(f"Fichier {MIDI_CONFIG_FILE} introuvable. Création d'une configuration par défaut...")
         self.midi_config = {
             "system_volume": 7,
+            "volume": 6,
             "play": 41,
             "stop": 42,
-            "mute": 43,
-            "volume": 14,
-            "goto_a": 48,
-            "goto_b": 49,
-            "goto_c": 50,
-            "goto_d": 51,
-            "set_a": 64,
-            "set_b": 65,
-            "set_c": 66,
-            "set_d": 67,
+            "rewind": 43,
+            "ff": 44,
+            "set_a": 32,
+            "set_b": 33,
+            "set_c": 34,
+            "set_d": 35,
+            "goto_a": 64,
+            "goto_b": 65,
+            "goto_c": 66,
+            "goto_d": 67,
             "cycle": 46,
-            "speed_up": 58,
-            "speed_down": 59,
-            "speed_reset": 60
+            "speed_pot": 22,
+            "speed_toggle": 38
         }
         self.save_midi_config()
         return True
@@ -152,6 +161,9 @@ class AudioPlayerClient:
                 self.set_led(action, False)
         if "cycle" in self.midi_config:
             self.set_led("cycle", False)
+        if "speed_toggle" in self.midi_config:
+            self.set_led("speed_toggle", False)
+        self.speed_mode_active = False
 
     def disable_loop(self):
         self.is_looping = False
@@ -160,36 +172,50 @@ class AudioPlayerClient:
     def reset_speed(self):
         self.current_rate = 1.0
         self.player.set_rate(self.current_rate)
+        self.save_track_data()
 
-    # --- GESTION DE LA PERSISTANCE DES TAGS PAR FICHIER MP3 ---
-    def save_tags_for_current_track(self):
+    # --- GESTION DE LA PERSISTANCE DES DONNÉES (TAGS + VITESSE) PAR FICHIER MP3 ---
+    def save_track_data(self):
         if self.current_mp3_path:
-            # Ex: /path/to/track/melody.mp3 -> /path/to/track/melody.json
             base_name, _ = os.path.splitext(self.current_mp3_path)
-            tags_file = f"{base_name}.json"
+            data_file = f"{base_name}.json"
             try:
-                with open(tags_file, 'w', encoding='utf-8') as f:
-                    json.dump(self.locators, f, indent=4)
-                print(f"Tags sauvegardés dans : {tags_file}")
+                data_to_save = {
+                    "locators": self.locators,
+                    "speed": self.current_rate
+                }
+                with open(data_file, 'w', encoding='utf-8') as f:
+                    json.dump(data_to_save, f, indent=4)
+                print(f"Données de piste sauvegardées dans : {data_file}")
             except Exception as e:
-                print(f"Erreur sauvegarde tags: {e}")
+                print(f"Erreur sauvegarde données piste: {e}")
 
-    def load_tags_for_current_track(self):
+    def load_track_data(self):
         if self.current_mp3_path:
             base_name, _ = os.path.splitext(self.current_mp3_path)
-            tags_file = f"{base_name}.json"
-            if os.path.exists(tags_file):
+            data_file = f"{base_name}.json"
+            if os.path.exists(data_file):
                 try:
-                    with open(tags_file, 'r', encoding='utf-8') as f:
-                        loaded_tags = json.load(f)
+                    with open(data_file, 'r', encoding='utf-8') as f:
+                        loaded_data = json.load(f)
+                        
+                        if isinstance(loaded_data, dict) and "locators" in loaded_data:
+                            loaded_locators = loaded_data["locators"]
+                            self.current_rate = loaded_data.get("speed", 1.0)
+                        else:
+                            loaded_locators = loaded_data
+                            self.current_rate = 1.0
+
                         for key in ["a", "b", "c", "d"]:
-                            if key in loaded_tags:
-                                self.locators[key] = loaded_tags[key]
+                            if key in loaded_locators:
+                                self.locators[key] = loaded_locators[key]
                                 if self.locators[key] > 0:
                                     self.set_led(f"goto_{key}", True)
-                    print(f"Tags chargés depuis : {tags_file}")
+                        
+                        self.player.set_rate(self.current_rate)
+                        print(f"Données de piste chargées depuis : {data_file} (Vitesse: {int(self.current_rate * 100)}%)")
                 except Exception as e:
-                    print(f"Erreur lecture tags: {e}")
+                    print(f"Erreur lecture données piste: {e}")
 
     # --- FONCTIONS DE CONTRÔLE VOLUME PC ---
     def set_system_volume(self, value):
@@ -219,13 +245,41 @@ class AudioPlayerClient:
 
             time.sleep(0.03)
 
+    # --- GESTION INTELLIGENTE DE LA VITESSE (0 = -50% / 127 = 100%) ---
+    def set_speed_value(self, value):
+        with self._lock:
+            self.target_speed_value = value
+
+        if not self.speed_thread_running:
+            self.speed_thread_running = True
+            threading.Thread(target=self._process_speed_queue, daemon=True).start()
+
+    def _process_speed_queue(self):
+        while True:
+            with self._lock:
+                current_target = self.target_speed_value
+                self.target_speed_value = None  # Consommé
+
+            if current_target is None:
+                self.speed_thread_running = False
+                break
+
+            # Plage : 0 -> 0.5 (-50%), 127 -> 1.0 (100% / Normal)
+            self.current_rate = round(0.5 + (current_target / 127.0) * 0.5, 2)
+            
+            self.player.set_rate(self.current_rate)
+            print(f"Vitesse ajustée via potard : {int(self.current_rate * 100)}%")
+            self.save_track_data()
+
+            time.sleep(0.01)
+
     def toggle_system_mute(self):
         subprocess.run(["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"], check=False)
 
     def midi_callback(self, channel, control, value, timestamp):
         for action, mapped_control in self.midi_config.items():
             if control == int(mapped_control):
-                if value == 0 and action not in ["volume", "system_volume"]:
+                if value == 0 and action not in ["volume", "system_volume", "speed_pot", "speed_toggle"]:
                     return
                 self.execute_action(action, value)
                 break
@@ -245,6 +299,25 @@ class AudioPlayerClient:
             self.toggle_system_mute()
             return
 
+        elif action == "speed_toggle":
+            if value > 0:  # Déclenchement sur l'appui du bouton
+                self.speed_mode_active = not self.speed_mode_active
+                self.set_led("speed_toggle", self.speed_mode_active)
+                print(f"Mode Vitesse : {'ACTIVÉ' if self.speed_mode_active else 'DÉSACTIVÉ'}")
+                
+                if self.speed_mode_active:
+                    self.set_speed_value(self.last_pot_value)
+                else:
+                    self.reset_speed()
+                    print("Vitesse réinitialisée à 100% suite à la désactivation du mode S.")
+            return
+
+        elif action == "speed_pot":
+            self.last_pot_value = value
+            if self.speed_mode_active:
+                self.set_speed_value(value)
+            return
+
         if action == "play":
             state = self.player.get_state()
             if state == vlc.State.Playing:
@@ -252,6 +325,7 @@ class AudioPlayerClient:
             elif state == vlc.State.Ended:
                 self.player.stop()
                 self.player.play()
+                self.player.set_rate(self.current_rate)
             else:
                 self.player.play()
                 self.player.set_rate(self.current_rate)
@@ -274,20 +348,6 @@ class AudioPlayerClient:
         elif action == "rewind":
             self.player.set_time(max(0, self.player.get_time() - FF_RW_MSEC))
 
-        elif action == "speed_up":
-            self.current_rate = round(min(2.0, self.current_rate + 0.05), 2)
-            self.player.set_rate(self.current_rate)
-            print(f"Vitesse de lecture : {int(self.current_rate * 100)}%")
-
-        elif action == "speed_down":
-            self.current_rate = round(max(0.3, self.current_rate - 0.05), 2)
-            self.player.set_rate(self.current_rate)
-            print(f"Vitesse de lecture : {int(self.current_rate * 100)}%")
-
-        elif action == "speed_reset":
-            self.reset_speed()
-            print("Vitesse de lecture réinitialisée à 100%")
-
         elif action == "cycle":
             if self.locators["a"] < self.locators["b"]:
                 self.is_looping = not self.is_looping
@@ -302,7 +362,7 @@ class AudioPlayerClient:
             self.locators[key] = self.player.get_time()
             print(f"Tag {key.upper()} mémorisé à {self.locators[key]/1000:.1f}s")
             self.set_led(f"goto_{key}", True)
-            self.save_tags_for_current_track()
+            self.save_track_data()
 
         elif action.startswith("goto_"):
             key = action.split("_")[1]
@@ -423,16 +483,20 @@ class AudioPlayerClient:
                         mp3_path = self.find_mp3(new_loc)
                         
                         if self.current_db_track_path and self.current_mp3_path:
-                            self.load_tags_for_current_track()
+                            self.load_track_data()
 
+                        self.player.stop()
                         if mp3_path != None:
-                            self.player.set_media(self.instance.media_new(mp3_path))
+                            media = self.instance.media_new(mp3_path)
+                            self.player.set_media(media)
                         else:
-                            self.player.set_media(self.instance.media_new("./404_vocal_msg.mp3"))
+                            media = self.instance.media_new("./404_vocal_msg.mp3")
+                            self.player.set_media(media)
                         self.player.play()
+                        self.player.set_rate(self.current_rate)
             except Exception as e:
-                pass
-            time.sleep(0.05)
+                print(f"Erreur dans la boucle principale: {e}")
+            time.sleep(1.0)
 
 if __name__ == "__main__":
     try:
