@@ -10,6 +10,7 @@ import json
 import threading
 import socket
 import subprocess
+import atexit
 from tendo import singleton
 from midi import MIDI_IN, MIDI_OUT, getMidiinLabels, getMidioutLabels, CONTROL_CHANGE, NOTE_ON
 
@@ -53,10 +54,11 @@ class AudioPlayerClient:
         # État interne & anti-rebond MIDI
         self.locators = {"a": 0, "b": 0, "c": 0, "d": 0}
         self.is_muted = False
+        self.is_system_muted = False
         self.is_looping = False
         self.current_rate = 1.0
         self.speed_mode_active = False  # État du mode édition de vitesse (bouton S)
-        self.last_pot_value = 127       # Mémorisation de la dernière position physique du potard (défaut = max/100%)
+        self.last_pot_value = 127        # Mémorisation de la dernière position physique du potard (défaut = max/100%)
         
         # Variables pour la gestion fluide et sans perte du volume système et de la vitesse
         self.target_system_volume = None
@@ -65,7 +67,11 @@ class AudioPlayerClient:
         # Système intelligent de gestion de la vitesse (tendance / anti-latence)
         self.target_speed_value = None
         self.speed_thread_running = False
+        self.server_error_logged = False # Anti-spam pour l'absence de serveur
         self._lock = threading.Lock()
+        
+        # Sécurité anti-effet de bord : mémorisation des IDs mutés pour pouvoir les démuter à la sortie
+        self.muted_node_ids = set()
 
     def udp_listener(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -131,7 +137,9 @@ class AudioPlayerClient:
             "goto_d": 67,
             "cycle": 46,
             "speed_pot": 22,
-            "speed_toggle": 38
+            "speed_toggle": 38,
+            "volume_mute": 54,
+            "system_mute": 55
         }
         self.save_midi_config()
         return True
@@ -163,6 +171,10 @@ class AudioPlayerClient:
             self.set_led("cycle", False)
         if "speed_toggle" in self.midi_config:
             self.set_led("speed_toggle", False)
+        if "volume_mute" in self.midi_config:
+            self.set_led("volume_mute", self.is_muted)
+        if "system_mute" in self.midi_config:
+            self.set_led("system_mute", self.is_system_muted)
         self.speed_mode_active = False
 
     def disable_loop(self):
@@ -273,13 +285,51 @@ class AudioPlayerClient:
 
             time.sleep(0.01)
 
-    def toggle_system_mute(self):
-        subprocess.run(["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"], check=False)
+    def toggle_system_mute(self, mute_state):
+        """Coupe ou rétablit tous les flux audio sauf VLC pour éviter les bruits parasites."""
+        try:
+            result = subprocess.run(["pw-dump"], capture_output=True, text=True, check=True)
+            nodes = json.loads(result.stdout)
+            
+            val = "1" if mute_state else "0"
+            
+            for node in nodes:
+                if node.get("type") == "PipeWire:Interface:Node":
+                    props = node.get("info", {}).get("props", {})
+                    media_class = props.get("media.class", "")
+                    
+                    if "Stream" in media_class and "Audio" in media_class:
+                        app_name = props.get("application.name", "").lower()
+                        node_id = str(node.get("id"))
+                        
+                        # On épargne VLC
+                        if "vlc" not in app_name:
+                            if mute_state:
+                                subprocess.run(["wpctl", "set-mute", node_id, "1"], check=False)
+                                self.muted_node_ids.add(node_id)
+                            else:
+                                # On ne redéroute/démute que ceux qu'on avait mutés nous-mêmes
+                                if node_id in self.muted_node_ids:
+                                    subprocess.run(["wpctl", "set-mute", node_id, "0"], check=False)
+            
+            if not mute_state:
+                self.muted_node_ids.clear()
+                
+        except Exception as e:
+            print(f"Erreur lors de la gestion des flux tiers (mute/unmute) : {e}")
+
+    def cleanup_on_exit(self):
+        """Nettoyage de sécurité appelé à la fermeture du programme pour éviter l'effet de bord."""
+        if self.muted_node_ids:
+            print("\n[Sécurité] Restauration du son des applications tierces...")
+            for node_id in list(self.muted_node_ids):
+                subprocess.run(["wpctl", "set-mute", node_id, "0"], check=False)
+            self.muted_node_ids.clear()
 
     def midi_callback(self, channel, control, value, timestamp):
         for action, mapped_control in self.midi_config.items():
             if control == int(mapped_control):
-                if value == 0 and action not in ["volume", "system_volume", "speed_pot", "speed_toggle"]:
+                if value == 0 and action not in ["volume", "system_volume", "speed_pot", "speed_toggle", "volume_mute", "system_mute"]:
                     return
                 self.execute_action(action, value)
                 break
@@ -295,8 +345,20 @@ class AudioPlayerClient:
             self.set_system_volume(value)
             return
 
+        elif action == "volume_mute" or action == "mute":
+            if value > 0:  # Action sur l'appui du bouton
+                self.is_muted = not self.is_muted
+                self.player.audio_set_mute(self.is_muted)
+                self.set_led("volume_mute", self.is_muted)
+                print(f"Lecteur VLC Mute : {'ACTIVÉ' if self.is_muted else 'DÉSACTIVÉ'}")
+            return
+
         elif action == "system_mute":
-            self.toggle_system_mute()
+            if value > 0:  # Action sur l'appui du bouton
+                self.is_system_muted = not self.is_system_muted
+                self.toggle_system_mute(self.is_system_muted)
+                self.set_led("system_mute", self.is_system_muted)
+                print(f"Volume général Mute : {'ACTIVÉ' if self.is_system_muted else 'DÉSACTIVÉ'}")
             return
 
         elif action == "speed_toggle":
@@ -335,10 +397,6 @@ class AudioPlayerClient:
             self.disable_loop()
             self.reset_speed()
             
-        elif action == "mute":
-            self.is_muted = not self.is_muted
-            self.player.audio_set_mute(self.is_muted)
-
         elif action == "goto_start":
             self.player.set_time(0)
 
@@ -470,6 +528,7 @@ class AudioPlayerClient:
 
                 response = requests.get(SERVER_URL, timeout=5)
                 if response.status_code == 200:
+                    self.server_error_logged = False # Réinitialisation si la connexion refonctionne
                     new_loc = response.text.strip()
                     if new_loc != self.current_loc:
                         print(f"-> Chargement via Database (Polling HTTP) : {new_loc}")
@@ -494,6 +553,10 @@ class AudioPlayerClient:
                             self.player.set_media(media)
                         self.player.play()
                         self.player.set_rate(self.current_rate)
+            except requests.exceptions.ConnectionError:
+                if not self.server_error_logged:
+                    print(f"Serveur injoignable ({SERVER_URL}). Le polling HTTP est en attente...")
+                    self.server_error_logged = True
             except Exception as e:
                 print(f"Erreur dans la boucle principale: {e}")
             time.sleep(1.0)
@@ -506,6 +569,9 @@ if __name__ == "__main__":
         sys.exit(1)
 
     audio_client = AudioPlayerClient()
+
+    # Enregistrement de la fonction de nettoyage automatique à la sortie
+    atexit.register(audio_client.cleanup_on_exit)
 
     if "-config" in sys.argv:
         audio_client.run_config_wizard()
