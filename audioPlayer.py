@@ -43,7 +43,7 @@ class AudioPlayerClient:
         self.player = self.instance.media_player_new()
         self.current_loc = None
         self.current_db_track_path = None
-        self.current_mp3_path = None  # Chemin complet du MP3 en cours (pour la persistance par piste)
+        self.current_mp3_path = None  # Chemin complet du MP3 en cours
         self.midi_config = {}
         self.midi_in = MIDI_IN()
         self.midi_out = MIDI_OUT()
@@ -58,7 +58,7 @@ class AudioPlayerClient:
         self.is_looping = False
         self.current_rate = 1.0
         self.speed_mode_active = False  # État du mode édition de vitesse (bouton S)
-        self.last_pot_value = 127        # Mémorisation de la dernière position physique du potard (défaut = max/100%)
+        self.last_pot_value = 127        # Mémorisation de la dernière position physique du potard (défault = max/100%)
         
         # Variables pour la gestion fluide et sans perte du volume système et de la vitesse
         self.target_system_volume = None
@@ -87,8 +87,6 @@ class AudioPlayerClient:
                 if mp3_path:
                     if os.path.isfile(message):
                         print(f"-> Chargement via Pop-up Système (Fichier direct) : {mp3_path}")
-                        self.current_db_track_path = None
-                        self.current_mp3_path = mp3_path
                     else:
                         print(f"-> Chargement via UDP (Répertoire Database) : {mp3_path}")
 
@@ -186,11 +184,17 @@ class AudioPlayerClient:
         self.player.set_rate(self.current_rate)
         self.save_track_data()
 
-    # --- GESTION DE LA PERSISTANCE DES DONNÉES (TAGS + VITESSE) PAR FICHIER MP3 ---
+    # --- GESTION DE LA PERSISTANCE (UNIQUEMENT DANS LA DATABASE) ---
+    def get_track_data_file(self):
+        """Renvoie le chemin du fichier JSON uniquement si le MP3 est dans la database.
+           Sinon, retourne None pour ne rien créer à l'extérieur."""
+        if self.current_db_track_path and os.path.exists(self.current_db_track_path):
+            return os.path.join(self.current_db_track_path, "track_config.json")
+        return None
+
     def save_track_data(self):
-        if self.current_mp3_path:
-            base_name, _ = os.path.splitext(self.current_mp3_path)
-            data_file = f"{base_name}.json"
+        data_file = self.get_track_data_file()
+        if data_file:
             try:
                 data_to_save = {
                     "locators": self.locators,
@@ -198,36 +202,34 @@ class AudioPlayerClient:
                 }
                 with open(data_file, 'w', encoding='utf-8') as f:
                     json.dump(data_to_save, f, indent=4)
-                print(f"Données de piste sauvegardées dans : {data_file}")
+                print(f"Données de piste sauvegardées dans la database : {data_file}")
             except Exception as e:
                 print(f"Erreur sauvegarde données piste: {e}")
 
     def load_track_data(self):
-        if self.current_mp3_path:
-            base_name, _ = os.path.splitext(self.current_mp3_path)
-            data_file = f"{base_name}.json"
-            if os.path.exists(data_file):
-                try:
-                    with open(data_file, 'r', encoding='utf-8') as f:
-                        loaded_data = json.load(f)
-                        
-                        if isinstance(loaded_data, dict) and "locators" in loaded_data:
-                            loaded_locators = loaded_data["locators"]
-                            self.current_rate = loaded_data.get("speed", 1.0)
-                        else:
-                            loaded_locators = loaded_data
-                            self.current_rate = 1.0
+        data_file = self.get_track_data_file()
+        if data_file and os.path.exists(data_file):
+            try:
+                with open(data_file, 'r', encoding='utf-8') as f:
+                    loaded_data = json.load(f)
+                    
+                    if isinstance(loaded_data, dict) and "locators" in loaded_data:
+                        loaded_locators = loaded_data["locators"]
+                        self.current_rate = loaded_data.get("speed", 1.0)
+                    else:
+                        loaded_locators = loaded_data
+                        self.current_rate = 1.0
 
-                        for key in ["a", "b", "c", "d"]:
-                            if key in loaded_locators:
-                                self.locators[key] = loaded_locators[key]
-                                if self.locators[key] > 0:
-                                    self.set_led(f"goto_{key}", True)
-                        
-                        self.player.set_rate(self.current_rate)
-                        print(f"Données de piste chargées depuis : {data_file} (Vitesse: {int(self.current_rate * 100)}%)")
-                except Exception as e:
-                    print(f"Erreur lecture données piste: {e}")
+                    for key in ["a", "b", "c", "d"]:
+                        if key in loaded_locators:
+                            self.locators[key] = loaded_locators[key]
+                            if self.locators[key] > 0:
+                                self.set_led(f"goto_{key}", True)
+                    
+                    self.player.set_rate(self.current_rate)
+                    print(f"Données de piste chargées depuis la database (Vitesse: {int(self.current_rate * 100)}%)")
+            except Exception as e:
+                print(f"Erreur lecture données piste: {e}")
 
     # --- FONCTIONS DE CONTRÔLE VOLUME PC ---
     def set_system_volume(self, value):
@@ -291,8 +293,6 @@ class AudioPlayerClient:
             result = subprocess.run(["pw-dump"], capture_output=True, text=True, check=True)
             nodes = json.loads(result.stdout)
             
-            val = "1" if mute_state else "0"
-            
             for node in nodes:
                 if node.get("type") == "PipeWire:Interface:Node":
                     props = node.get("info", {}).get("props", {})
@@ -308,7 +308,6 @@ class AudioPlayerClient:
                                 subprocess.run(["wpctl", "set-mute", node_id, "1"], check=False)
                                 self.muted_node_ids.add(node_id)
                             else:
-                                # On ne redéroute/démute que ceux qu'on avait mutés nous-mêmes
                                 if node_id in self.muted_node_ids:
                                     subprocess.run(["wpctl", "set-mute", node_id, "0"], check=False)
             
@@ -319,7 +318,6 @@ class AudioPlayerClient:
             print(f"Erreur lors de la gestion des flux tiers (mute/unmute) : {e}")
 
     def cleanup_on_exit(self):
-        """Nettoyage de sécurité appelé à la fermeture du programme pour éviter l'effet de bord."""
         if self.muted_node_ids:
             print("\n[Sécurité] Restauration du son des applications tierces...")
             for node_id in list(self.muted_node_ids):
@@ -346,7 +344,7 @@ class AudioPlayerClient:
             return
 
         elif action == "volume_mute" or action == "mute":
-            if value > 0:  # Action sur l'appui du bouton
+            if value > 0:  
                 self.is_muted = not self.is_muted
                 self.player.audio_set_mute(self.is_muted)
                 self.set_led("volume_mute", self.is_muted)
@@ -354,7 +352,7 @@ class AudioPlayerClient:
             return
 
         elif action == "system_mute":
-            if value > 0:  # Action sur l'appui du bouton
+            if value > 0:  
                 self.is_system_muted = not self.is_system_muted
                 self.toggle_system_mute(self.is_system_muted)
                 self.set_led("system_mute", self.is_system_muted)
@@ -362,7 +360,7 @@ class AudioPlayerClient:
             return
 
         elif action == "speed_toggle":
-            if value > 0:  # Déclenchement sur l'appui du bouton
+            if value > 0:  
                 self.speed_mode_active = not self.speed_mode_active
                 self.set_led("speed_toggle", self.speed_mode_active)
                 print(f"Mode Vitesse : {'ACTIVÉ' if self.speed_mode_active else 'DÉSACTIVÉ'}")
@@ -528,7 +526,7 @@ class AudioPlayerClient:
 
                 response = requests.get(SERVER_URL, timeout=5)
                 if response.status_code == 200:
-                    self.server_error_logged = False # Réinitialisation si la connexion refonctionne
+                    self.server_error_logged = False 
                     new_loc = response.text.strip()
                     if new_loc != self.current_loc:
                         print(f"-> Chargement via Database (Polling HTTP) : {new_loc}")
@@ -570,7 +568,6 @@ if __name__ == "__main__":
 
     audio_client = AudioPlayerClient()
 
-    # Enregistrement de la fonction de nettoyage automatique à la sortie
     atexit.register(audio_client.cleanup_on_exit)
 
     if "-config" in sys.argv:
