@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/init/python
 # -*- coding: utf-8 -*-
 
 import requests
@@ -37,6 +37,17 @@ AUDIO_CONFIG_FILE = "audio_config.json"
 AUDIO_SPLASH_FILE = "audioSplash.mp3"
 FF_RW_MSEC = 2000
 
+def is_target_browser(props):
+    """Détecte si un nœud PipeWire appartient à un navigateur web."""
+    if not isinstance(props, dict):
+        return False
+    browsers = ["firefox", "chrome", "chromium", "brave", "edge", "opera", "vivaldi"]
+    app_name = str(props.get("application.name", "") or "").lower()
+    node_name = str(props.get("node.name", "") or "").lower()
+    binary = str(props.get("process.binary", "") or "").lower()
+    
+    return any(b in app_name or b in node_name or b in binary for b in browsers)
+
 class AudioPlayerClient:
     def __init__(self):
         self.instance = vlc.Instance('--no-video', '--quiet')
@@ -54,15 +65,19 @@ class AudioPlayerClient:
         # État interne & anti-rebond MIDI
         self.locators = {"a": 0, "b": 0, "c": 0, "d": 0}
         self.is_muted = False
-        self.is_system_muted = False
+        self.is_system_muted = False      # État Mute Tout sauf Navigateur (M8)
+        self.is_browser_muted = False     # État Mute Navigateur uniquement (M6)
         self.is_looping = False
         self.current_rate = 1.0
         self.speed_mode_active = False  # État du mode édition de vitesse (bouton S)
         self.last_pot_value = 127        # Mémorisation de la dernière position physique du potard (défault = max/100%)
         
-        # Variables pour la gestion fluide et sans perte du volume système et de la vitesse
+        # Variables pour la gestion fluide du volume système et du navigateur (YouTube)
         self.target_system_volume = None
         self.volume_thread_running = False
+        
+        self.target_browser_volume = None
+        self.browser_volume_thread_running = False
         
         # Système intelligent de gestion de la vitesse (tendance / anti-latence)
         self.target_speed_value = None
@@ -93,10 +108,11 @@ class AudioPlayerClient:
                     self.locators = {"a": 0, "b": 0, "c": 0, "d": 0}
                     self.clear_all_tags_leds()
                     self.disable_loop()
-                    self.reset_speed()
                     
                     if self.current_db_track_path and self.current_mp3_path:
                         self.load_track_data()
+                    else:
+                        self.reset_speed()
                     
                     self.player.stop()
                     media = self.instance.media_new(mp3_path)
@@ -109,18 +125,11 @@ class AudioPlayerClient:
                 print(f"Erreur UDP: {e}")
 
     def load_midi_config(self):
-        if os.path.exists(MIDI_CONFIG_FILE):
-            try:
-                with open(MIDI_CONFIG_FILE, 'r', encoding='utf-8') as f:
-                    self.midi_config = json.load(f)
-                return True
-            except Exception as e:
-                print(f"Erreur lecture {MIDI_CONFIG_FILE}: {e}")
-        
-        print(f"Fichier {MIDI_CONFIG_FILE} introuvable. Création d'une configuration par défaut...")
-        self.midi_config = {
-            "system_volume": 7,
-            "volume": 6,
+        default_config = {
+            "system_volume": 7,      # Slider 8 (System Vol)
+            "volume": 6,              # Slider 7 (VLC Vol)
+            "firefox_volume": 5,    # Slider 6 (Navigateur / YouTube)
+            "firefox_mute": 53,     # Bouton Mute 6 (M6 - Navigateur / YouTube)
             "play": 41,
             "stop": 42,
             "rewind": 43,
@@ -134,16 +143,35 @@ class AudioPlayerClient:
             "goto_c": 66,
             "goto_d": 67,
             "cycle": 46,
-            "speed_pot": 22,
-            "speed_toggle": 38,
-            "volume_mute": 54,
-            "system_mute": 55
+            "speed_pot": 22,        # Knob 7 (Potard Vitesse)
+            "speed_toggle": 38,     # Solo 7 (S7)
+            "volume_mute": 54,      # Mute 7 (M7)
+            "system_mute": 55       # Mute 8 (M8)
         }
+
+        if os.path.exists(MIDI_CONFIG_FILE):
+            try:
+                with open(MIDI_CONFIG_FILE, 'r', encoding='utf-8') as f:
+                    self.midi_config = json.load(f)
+                
+                updated = False
+                for k, v in default_config.items():
+                    if k not in self.midi_config:
+                        self.midi_config[k] = v
+                        updated = True
+                if updated:
+                    self.save_midi_config()
+                return True
+            except Exception as e:
+                print(f"Erreur lecture {MIDI_CONFIG_FILE}: {e}")
+
+        print(f"Fichier {MIDI_CONFIG_FILE} introuvable. Création d'une configuration par défaut...")
+        self.midi_config = default_config
         self.save_midi_config()
         return True
 
     def save_midi_config(self):
-        with open(MIDI_CONFIG_FILE, 'w') as f:
+        with open(MIDI_CONFIG_FILE, 'w', encoding='utf-8') as f:
             json.dump(self.midi_config, f, indent=4)
 
     def set_led(self, control_or_action, state):
@@ -173,6 +201,8 @@ class AudioPlayerClient:
             self.set_led("volume_mute", self.is_muted)
         if "system_mute" in self.midi_config:
             self.set_led("system_mute", self.is_system_muted)
+        if "firefox_mute" in self.midi_config:
+            self.set_led("firefox_mute", self.is_browser_muted)
         self.speed_mode_active = False
 
     def disable_loop(self):
@@ -182,12 +212,9 @@ class AudioPlayerClient:
     def reset_speed(self):
         self.current_rate = 1.0
         self.player.set_rate(self.current_rate)
-        self.save_track_data()
 
     # --- GESTION DE LA PERSISTANCE (UNIQUEMENT DANS LA DATABASE) ---
     def get_track_data_file(self):
-        """Renvoie le chemin du fichier JSON uniquement si le MP3 est dans la database.
-           Sinon, retourne None pour ne rien créer à l'extérieur."""
         if self.current_db_track_path and os.path.exists(self.current_db_track_path):
             return os.path.join(self.current_db_track_path, "track_config.json")
         return None
@@ -197,8 +224,7 @@ class AudioPlayerClient:
         if data_file:
             try:
                 data_to_save = {
-                    "locators": self.locators,
-                    "speed": self.current_rate
+                    "locators": self.locators
                 }
                 with open(data_file, 'w', encoding='utf-8') as f:
                     json.dump(data_to_save, f, indent=4)
@@ -212,24 +238,25 @@ class AudioPlayerClient:
             try:
                 with open(data_file, 'r', encoding='utf-8') as f:
                     loaded_data = json.load(f)
-                    
-                    if isinstance(loaded_data, dict) and "locators" in loaded_data:
-                        loaded_locators = loaded_data["locators"]
-                        self.current_rate = loaded_data.get("speed", 1.0)
-                    else:
-                        loaded_locators = loaded_data
-                        self.current_rate = 1.0
+                
+                # Rétrocompatibilité : si l'ancien fichier contient "locators", on extrait le dictionnaire
+                if isinstance(loaded_data, dict) and "locators" in loaded_data:
+                    loaded_locators = loaded_data["locators"]
+                else:
+                    loaded_locators = loaded_data
 
-                    for key in ["a", "b", "c", "d"]:
-                        if key in loaded_locators:
-                            self.locators[key] = loaded_locators[key]
-                            if self.locators[key] > 0:
-                                self.set_led(f"goto_{key}", True)
-                    
-                    self.player.set_rate(self.current_rate)
-                    print(f"Données de piste chargées depuis la database (Vitesse: {int(self.current_rate * 100)}%)")
+                for key in ["a", "b", "c", "d"]:
+                    if key in loaded_locators:
+                        self.locators[key] = loaded_locators[key]
+                        if self.locators[key] > 0:
+                            self.set_led(f"goto_{key}", True)
+                
+                print("Données de piste (locators) chargées depuis la database.")
             except Exception as e:
                 print(f"Erreur lecture données piste: {e}")
+        
+        # On remet toujours la vitesse à 1.0 au chargement d'un morceau (plus de lecture/sauvegarde de speed)
+        self.reset_speed()
 
     # --- FONCTIONS DE CONTRÔLE VOLUME PC ---
     def set_system_volume(self, value):
@@ -259,7 +286,61 @@ class AudioPlayerClient:
 
             time.sleep(0.03)
 
-    # --- GESTION INTELLIGENTE DE LA VITESSE (0 = -50% / 127 = 100%) ---
+    # --- FONCTIONS DE CONTRÔLE VOLUME NAVIGATEUR/YOUTUBE ---
+    def set_firefox_volume(self, value):
+        with self._lock:
+            self.target_browser_volume = value
+
+        if not self.browser_volume_thread_running:
+            self.browser_volume_thread_running = True
+            threading.Thread(target=self._process_browser_volume_queue, daemon=True).start()
+
+    def _process_browser_volume_queue(self):
+        last_applied = -1
+        while True:
+            with self._lock:
+                current_target = self.target_browser_volume
+
+            if current_target == last_applied:
+                with self._lock:
+                    if self.target_browser_volume == last_applied:
+                        self.browser_volume_thread_running = False
+                        break
+
+            if current_target is not None:
+                last_applied = current_target
+                vol = current_target / 127.0
+                
+                try:
+                    result = subprocess.run(["pw-dump"], capture_output=True, text=True, check=True)
+                    nodes = json.loads(result.stdout)
+                    for node in nodes:
+                        if node.get("type") == "PipeWire:Interface:Node":
+                            props = node.get("info", {}).get("props", {})
+                            
+                            if is_target_browser(props):
+                                node_id = str(node.get("id"))
+                                subprocess.run(["wpctl", "set-volume", node_id, f"{vol}"], check=False)
+                except Exception as e:
+                    print(f"Erreur ajustement volume Navigateur/YouTube: {e}")
+
+            time.sleep(0.03)
+
+    def toggle_browser_mute(self, mute_state):
+        try:
+            result = subprocess.run(["pw-dump"], capture_output=True, text=True, check=True)
+            nodes = json.loads(result.stdout)
+            
+            for node in nodes:
+                if node.get("type") == "PipeWire:Interface:Node":
+                    props = node.get("info", {}).get("props", {})
+                    
+                    if is_target_browser(props):
+                        node_id = str(node.get("id"))
+                        subprocess.run(["wpctl", "set-mute", node_id, "1" if mute_state else "0"], check=False)
+        except Exception as e:
+            print(f"Erreur lors du Mute du Navigateur : {e}")
+
     def set_speed_value(self, value):
         with self._lock:
             self.target_speed_value = value
@@ -272,23 +353,20 @@ class AudioPlayerClient:
         while True:
             with self._lock:
                 current_target = self.target_speed_value
-                self.target_speed_value = None  # Consommé
+                self.target_speed_value = None
 
             if current_target is None:
                 self.speed_thread_running = False
                 break
 
-            # Plage : 0 -> 0.5 (-50%), 127 -> 1.0 (100% / Normal)
             self.current_rate = round(0.5 + (current_target / 127.0) * 0.5, 2)
-            
             self.player.set_rate(self.current_rate)
             print(f"Vitesse ajustée via potard : {int(self.current_rate * 100)}%")
-            self.save_track_data()
+            # La vitesse n'est plus sauvegardée sur le disque
 
             time.sleep(0.01)
 
     def toggle_system_mute(self, mute_state):
-        """Coupe ou rétablit tous les flux audio sauf VLC pour éviter les bruits parasites."""
         try:
             result = subprocess.run(["pw-dump"], capture_output=True, text=True, check=True)
             nodes = json.loads(result.stdout)
@@ -296,14 +374,12 @@ class AudioPlayerClient:
             for node in nodes:
                 if node.get("type") == "PipeWire:Interface:Node":
                     props = node.get("info", {}).get("props", {})
-                    media_class = props.get("media.class", "")
+                    media_class = str(props.get("media.class", "") or "")
                     
                     if "Stream" in media_class and "Audio" in media_class:
-                        app_name = props.get("application.name", "").lower()
                         node_id = str(node.get("id"))
                         
-                        # On épargne VLC
-                        if "vlc" not in app_name:
+                        if not is_target_browser(props):
                             if mute_state:
                                 subprocess.run(["wpctl", "set-mute", node_id, "1"], check=False)
                                 self.muted_node_ids.add(node_id)
@@ -327,7 +403,7 @@ class AudioPlayerClient:
     def midi_callback(self, channel, control, value, timestamp):
         for action, mapped_control in self.midi_config.items():
             if control == int(mapped_control):
-                if value == 0 and action not in ["volume", "system_volume", "speed_pot", "speed_toggle", "volume_mute", "system_mute"]:
+                if value == 0 and action not in ["volume", "system_volume", "firefox_volume", "speed_pot", "speed_toggle", "volume_mute", "system_mute", "firefox_mute"]:
                     return
                 self.execute_action(action, value)
                 break
@@ -343,6 +419,10 @@ class AudioPlayerClient:
             self.set_system_volume(value)
             return
 
+        elif action == "firefox_volume":
+            self.set_firefox_volume(value)
+            return
+
         elif action == "volume_mute" or action == "mute":
             if value > 0:  
                 self.is_muted = not self.is_muted
@@ -351,12 +431,20 @@ class AudioPlayerClient:
                 print(f"Lecteur VLC Mute : {'ACTIVÉ' if self.is_muted else 'DÉSACTIVÉ'}")
             return
 
+        elif action == "firefox_mute":
+            if value > 0:
+                self.is_browser_muted = not self.is_browser_muted
+                self.toggle_browser_mute(self.is_browser_muted)
+                self.set_led("firefox_mute", self.is_browser_muted)
+                print(f"Mute Navigateur/YouTube (M6) : {'ACTIVÉ' if self.is_browser_muted else 'DÉSACTIVÉ'}")
+            return
+
         elif action == "system_mute":
             if value > 0:  
                 self.is_system_muted = not self.is_system_muted
                 self.toggle_system_mute(self.is_system_muted)
                 self.set_led("system_mute", self.is_system_muted)
-                print(f"Volume général Mute : {'ACTIVÉ' if self.is_system_muted else 'DÉSACTIVÉ'}")
+                print(f"Mute Tout Sauf Navigateur (M8) : {'ACTIVÉ' if self.is_system_muted else 'DÉSACTIVÉ'}")
             return
 
         elif action == "speed_toggle":
@@ -535,12 +623,13 @@ class AudioPlayerClient:
                         self.locators = {"a": 0, "b": 0, "c": 0, "d": 0}
                         self.clear_all_tags_leds()
                         self.disable_loop()
-                        self.reset_speed()
                         
                         mp3_path = self.find_mp3(new_loc)
                         
                         if self.current_db_track_path and self.current_mp3_path:
                             self.load_track_data()
+                        else:
+                            self.reset_speed()
 
                         self.player.stop()
                         if mp3_path != None:
