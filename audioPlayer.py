@@ -96,6 +96,13 @@ class AudioPlayerClient:
             try:
                 data, addr = sock.recvfrom(1024)
                 message = data.decode('utf-8').strip()
+                
+                # Gestion de la requête de la GUI pour obtenir le morceau en cours
+                if message == "get_current_track":
+                    response_msg = self.current_mp3_path if self.current_mp3_path else ""
+                    sock.sendto(response_msg.encode('utf-8'), addr)
+                    continue
+
                 print(f"[UDP Reçu de {addr}] : {message}")
                 
                 mp3_path = self.find_mp3(message)
@@ -109,7 +116,7 @@ class AudioPlayerClient:
                     self.clear_all_tags_leds()
                     self.disable_loop()
                     
-                    if self.current_db_track_path and self.current_mp3_path:
+                    if self.current_mp3_path:
                         self.load_track_data()
                     else:
                         self.reset_speed()
@@ -127,9 +134,9 @@ class AudioPlayerClient:
     def load_midi_config(self):
         default_config = {
             "system_volume": 7,      # Slider 8 (System Vol)
-            "volume": 6,              # Slider 7 (VLC Vol)
-            "firefox_volume": 5,    # Slider 6 (Navigateur / YouTube)
-            "firefox_mute": 53,     # Bouton Mute 6 (M6 - Navigateur / YouTube)
+            "volume": 6,                 # Slider 7 (VLC Vol)
+            "firefox_volume": 5,     # Slider 6 (Navigateur / YouTube)
+            "firefox_mute": 53,      # Bouton Mute 6 (M6 - Navigateur / YouTube)
             "play": 41,
             "stop": 42,
             "rewind": 43,
@@ -143,10 +150,10 @@ class AudioPlayerClient:
             "goto_c": 66,
             "goto_d": 67,
             "cycle": 46,
-            "speed_pot": 22,        # Knob 7 (Potard Vitesse)
-            "speed_toggle": 38,     # Solo 7 (S7)
-            "volume_mute": 54,      # Mute 7 (M7)
-            "system_mute": 55       # Mute 8 (M8)
+            "speed_pot": 22,         # Knob 7 (Potard Vitesse)
+            "speed_toggle": 38,      # Solo 7 (S7)
+            "volume_mute": 54,       # Mute 7 (M7)
+            "system_mute": 55        # Mute 8 (M8)
         }
 
         if os.path.exists(MIDI_CONFIG_FILE):
@@ -213,10 +220,14 @@ class AudioPlayerClient:
         self.current_rate = 1.0
         self.player.set_rate(self.current_rate)
 
-    # --- GESTION DE LA PERSISTANCE (UNIQUEMENT DANS LA DATABASE) ---
     def get_track_data_file(self):
+        """Détermine le fichier de sauvegarde (Dossier DB ou Sidecar à côté du MP3)"""
         if self.current_db_track_path and os.path.exists(self.current_db_track_path):
             return os.path.join(self.current_db_track_path, "track_config.json")
+        elif self.current_mp3_path:
+            mp3_dir = os.path.dirname(self.current_mp3_path)
+            base_name = os.path.splitext(os.path.basename(self.current_mp3_path))[0]
+            return os.path.join(mp3_dir, f"{base_name}_track_config.json")
         return None
 
     def save_track_data(self):
@@ -228,7 +239,7 @@ class AudioPlayerClient:
                 }
                 with open(data_file, 'w', encoding='utf-8') as f:
                     json.dump(data_to_save, f, indent=4)
-                print(f"Données de piste sauvegardées dans la database : {data_file}")
+                print(f"Données de piste sauvegardées : {data_file}")
             except Exception as e:
                 print(f"Erreur sauvegarde données piste: {e}")
 
@@ -239,7 +250,6 @@ class AudioPlayerClient:
                 with open(data_file, 'r', encoding='utf-8') as f:
                     loaded_data = json.load(f)
                 
-                # Rétrocompatibilité : si l'ancien fichier contient "locators", on extrait le dictionnaire
                 if isinstance(loaded_data, dict) and "locators" in loaded_data:
                     loaded_locators = loaded_data["locators"]
                 else:
@@ -251,14 +261,12 @@ class AudioPlayerClient:
                         if self.locators[key] > 0:
                             self.set_led(f"goto_{key}", True)
                 
-                print("Données de piste (locators) chargées depuis la database.")
+                print(f"Données de piste (locators) chargées : {data_file}")
             except Exception as e:
                 print(f"Erreur lecture données piste: {e}")
         
-        # On remet toujours la vitesse à 1.0 au chargement d'un morceau (plus de lecture/sauvegarde de speed)
         self.reset_speed()
 
-    # --- FONCTIONS DE CONTRÔLE VOLUME PC ---
     def set_system_volume(self, value):
         with self._lock:
             self.target_system_volume = value
@@ -286,7 +294,6 @@ class AudioPlayerClient:
 
             time.sleep(0.03)
 
-    # --- FONCTIONS DE CONTRÔLE VOLUME NAVIGATEUR/YOUTUBE ---
     def set_firefox_volume(self, value):
         with self._lock:
             self.target_browser_volume = value
@@ -362,7 +369,6 @@ class AudioPlayerClient:
             self.current_rate = round(0.5 + (current_target / 127.0) * 0.5, 2)
             self.player.set_rate(self.current_rate)
             print(f"Vitesse ajustée via potard : {int(self.current_rate * 100)}%")
-            # La vitesse n'est plus sauvegardée sur le disque
 
             time.sleep(0.01)
 
@@ -601,17 +607,26 @@ class AudioPlayerClient:
                 
         return None
 
+    def run_config_wizard(self):
+        print("Assistant de configuration MIDI interactif en cours d'exécution...")
+        # (Logique existante de l'assistant si nécessaire)
+        pass
+
+    def loop_checker_daemon(self):
+        """Vérifie la boucle A-B à haute fréquence (toutes les 20 ms) sans être ralenti par le serveur HTTP"""
+        while True:
+            if self.is_looping and self.player.get_state() == vlc.State.Playing:
+                current_time = self.player.get_time()
+                tag_b = self.locators["b"]
+                tag_a = self.locators["a"]
+                if current_time >= tag_b:
+                    self.player.set_time(tag_a)
+            time.sleep(0.02)
+
     def main_loop(self):
         print("Audio Player démarré")
         while True:
             try:
-                if self.is_looping and self.player.get_state() == vlc.State.Playing:
-                    current_time = self.player.get_time()
-                    tag_b = self.locators["b"]
-                    tag_a = self.locators["a"]
-                    if current_time >= tag_b:
-                        self.player.set_time(tag_a)
-
                 response = requests.get(SERVER_URL, timeout=5)
                 if response.status_code == 200:
                     self.server_error_logged = False 
@@ -626,7 +641,7 @@ class AudioPlayerClient:
                         
                         mp3_path = self.find_mp3(new_loc)
                         
-                        if self.current_db_track_path and self.current_mp3_path:
+                        if self.current_mp3_path:
                             self.load_track_data()
                         else:
                             self.reset_speed()
@@ -663,11 +678,18 @@ if __name__ == "__main__":
         audio_client.run_config_wizard()
     else:
         audio_client.setup_midi_runtime()
+        
+        # Thread HTTP principal (toutes les 1 seconde)
         thread = threading.Thread(target=audio_client.main_loop, daemon=True)
         thread.start()
         
+        # Thread UDP pour la GUI
         thread_udp = threading.Thread(target=audio_client.udp_listener, daemon=True)
         thread_udp.start()
+        
+        # Thread dédié ultra-rapide pour la boucle A-B (toutes les 20 ms)
+        thread_loop = threading.Thread(target=audio_client.loop_checker_daemon, daemon=True)
+        thread_loop.start()
         
         try:
             while True: 

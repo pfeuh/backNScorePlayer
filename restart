@@ -1,0 +1,3 @@
+#!/bin/bash
+pkill -f audioPlayer.py
+python3 audioPlayer.py &
