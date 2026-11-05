@@ -317,12 +317,12 @@ class AudioPlayerClient:
                     props = node.get("info", {}).get("props", {})
                     if "Stream" in str(props.get("media.class", "")) and "Audio" in str(props.get("media.class", "")):
                         node_id = str(node.get("id"))
-                        if not is_target_browser(props):
-                            if mute_state:
-                                subprocess.run(["wpctl", "set-mute", node_id, "1"], check=False)
-                                self.muted_node_ids.add(node_id)
-                            elif node_id in self.muted_node_ids:
-                                subprocess.run(["wpctl", "set-mute", node_id, "0"], check=False)
+                        # Suppression de l'exclusion de Firefox pour que le mute général touche tout
+                        if mute_state:
+                            subprocess.run(["wpctl", "set-mute", node_id, "1"], check=False)
+                            self.muted_node_ids.add(node_id)
+                        elif node_id in self.muted_node_ids:
+                            subprocess.run(["wpctl", "set-mute", node_id, "0"], check=False)
             if not mute_state:
                 self.muted_node_ids.clear()
         except Exception:
@@ -357,16 +357,19 @@ class AudioPlayerClient:
             if value > 0:
                 self.is_muted = not self.is_muted
                 self.player.audio_set_mute(self.is_muted)
+                self.set_led("volume_mute", self.is_muted)
             return
         elif action == "firefox_mute":
             if value > 0:
                 self.is_browser_muted = not self.is_browser_muted
                 self.toggle_browser_mute(self.is_browser_muted)
+                self.set_led("firefox_mute", self.is_browser_muted)
             return
         elif action == "system_mute":
             if value > 0:
                 self.is_system_muted = not self.is_system_muted
                 self.toggle_system_mute(self.is_system_muted)
+                self.set_led("system_mute", self.is_system_muted)
             return
         elif action == "speed_toggle":
             if value > 0:
@@ -438,7 +441,6 @@ class AudioPlayerClient:
         self.current_db_track_path = None
         self.current_mp3_path = None
 
-        # RÉCUPÉRATION DYNAMIQUE À CHAQUE RECHERCHE (Gère l'arrachement à chaud de la clé)
         current_db_dir = get_current_db_dir()
 
         if not current_db_dir or not os.path.exists(current_db_dir):
