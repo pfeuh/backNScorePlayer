@@ -79,6 +79,11 @@ class AudioPlayerClient:
         self.instance = vlc.Instance('--no-video', '--quiet', '--aout=pulse')
         self.player = self.instance.media_player_new()
         self.player.audio_set_volume(100)  # Volume VLC forcé à 100%
+        
+        # Enregistrement de l'événement de fin de lecture VLC
+        event_manager = self.player.event_manager()
+        event_manager.event_attach(vlc.EventType.MediaPlayerEndReached, self.on_end_reached)
+
         self.current_loc = None
         self.current_db_track_path = None
         self.current_mp3_path = None
@@ -95,6 +100,7 @@ class AudioPlayerClient:
         self.is_system_muted = False
         self.is_browser_muted = False
         self.is_looping = False
+        self.is_finished = False  # Indicateur de fin de lecture
         self.current_rate = 1.0
         self.speed_mode_active = False
         self.last_pot_value = 127
@@ -108,6 +114,10 @@ class AudioPlayerClient:
         self.server_error_logged = False
         self._lock = threading.Lock()
         self.muted_node_ids = set()
+
+    def on_end_reached(self, event):
+        """Déclenché automatiquement par VLC quand la lecture d'un média arrive à la fin."""
+        self.is_finished = True
 
     def udp_listener(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -131,6 +141,7 @@ class AudioPlayerClient:
                     self.locators = {"a": 0, "b": 0, "c": 0, "d": 0}
                     self.clear_all_tags_leds()
                     self.disable_loop()
+                    self.is_finished = False
                     
                     if self.current_mp3_path:
                         self.load_track_data()
@@ -317,7 +328,6 @@ class AudioPlayerClient:
                     props = node.get("info", {}).get("props", {})
                     if "Stream" in str(props.get("media.class", "")) and "Audio" in str(props.get("media.class", "")):
                         node_id = str(node.get("id"))
-                        # Suppression de l'exclusion de Firefox pour que le mute général touche tout
                         if mute_state:
                             subprocess.run(["wpctl", "set-mute", node_id, "1"], check=False)
                             self.muted_node_ids.add(node_id)
@@ -368,7 +378,7 @@ class AudioPlayerClient:
         elif action == "system_mute":
             if value > 0:
                 self.is_system_muted = not self.is_system_muted
-                self.toggle_system_mute(self.is_system_muted)
+                self.toggle_system_muted(self.is_system_muted)
                 self.set_led("system_mute", self.is_system_muted)
             return
         elif action == "speed_toggle":
@@ -390,14 +400,21 @@ class AudioPlayerClient:
             if state == vlc.State.Playing:
                 self.player.pause()
             else:
+                if self.is_finished:
+                    self.player.stop()
+                    self.player.set_time(0)
+                    self.is_finished = False
+                
                 self.player.play()
                 self.player.set_rate(self.current_rate)
         elif action == "stop":
             self.player.stop()
             self.disable_loop()
             self.reset_speed()
+            self.is_finished = False
         elif action == "goto_start":
             self.player.set_time(0)
+            self.is_finished = False
         elif action == "ff":
             self.player.set_time(self.player.get_time() + FF_RW_MSEC)
         elif action == "rewind":
@@ -511,6 +528,7 @@ class AudioPlayerClient:
                         self.locators = {"a": 0, "b": 0, "c": 0, "d": 0}
                         self.clear_all_tags_leds()
                         self.disable_loop()
+                        self.is_finished = False
                         
                         mp3_path = self.find_mp3(new_loc)
                         
