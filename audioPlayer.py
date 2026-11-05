@@ -118,6 +118,7 @@ class AudioPlayerClient:
     def on_end_reached(self, event):
         """Déclenché automatiquement par VLC quand la lecture d'un média arrive à la fin."""
         self.is_finished = True
+        self.set_led("play", False)  # Éteint la LED play à la fin du morceau
 
     def udp_listener(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -153,6 +154,7 @@ class AudioPlayerClient:
                     self.player.set_media(media)
                     self.player.play()
                     self.player.set_rate(self.current_rate)
+                    self.set_led("play", True)  # Allume la LED play lors du chargement/lancement auto
                 else:
                     self.execute_action(message, 127)
             except Exception as e:
@@ -196,6 +198,7 @@ class AudioPlayerClient:
             self.set_led(f"goto_{key}", False)
         self.set_led("cycle", False)
         self.set_led("speed_toggle", False)
+        self.set_led("play", False)  # Éteint aussi la LED play lors du reset des tags
         self.speed_mode_active = False
 
     def disable_loop(self):
@@ -399,6 +402,7 @@ class AudioPlayerClient:
             state = self.player.get_state()
             if state == vlc.State.Playing:
                 self.player.pause()
+                self.set_led("play", False)  # Éteint la LED si on passe en pause
             else:
                 if self.is_finished:
                     self.player.stop()
@@ -407,11 +411,13 @@ class AudioPlayerClient:
                 
                 self.player.play()
                 self.player.set_rate(self.current_rate)
+                self.set_led("play", True)  # Allume la LED si on passe en play
         elif action == "stop":
             self.player.stop()
             self.disable_loop()
             self.reset_speed()
             self.is_finished = False
+            self.set_led("play", False)  # Éteint la LED sur stop
         elif action == "goto_start":
             self.player.set_time(0)
             self.is_finished = False
@@ -540,6 +546,7 @@ class AudioPlayerClient:
                             self.player.set_media(media)
                             self.player.play()
                             self.player.set_rate(self.current_rate)
+                            self.set_led("play", True)  # Allume la LED play lors du changement de morceau
                         else:
                             print(f"-> ÉCHEC : Impossible de trouver un fichier MP3 valide pour '{new_loc}'.")
             except requests.exceptions.ConnectionError:
